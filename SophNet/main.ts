@@ -60,6 +60,15 @@ interface Message {
   content: string;
 }
 
+interface Reference {
+  content: string;
+  id: string;
+  index: number;
+  title: string;
+  type: string;
+  url: string;
+}
+
 // 从KV获取token
 async function getTokenFromKV(): Promise<TokenInfo | null> {
   const tokenEntry = await kv.get<TokenInfo>([TOKEN_KEY]);
@@ -288,6 +297,20 @@ function processFullContext(messages: Message[]): Message[] {
   return [...systemMessages, historySummary, ...recentMessages];
 }
 
+// 将数字转换为上标形式
+function convertToSuperscript(num: number): string {
+  const normalDigits = '0123456789';
+  const superscriptDigits = '⁰¹²³⁴⁵⁶⁷⁸⁹';
+  
+  return num.toString()
+    .split('')
+    .map(char => {
+      const index = normalDigits.indexOf(char);
+      return index !== -1 ? superscriptDigits[index] : char;
+    })
+    .join('');
+}
+
 // 处理聊天完成请求
 async function handleChatCompletions(
   token: string,
@@ -361,11 +384,37 @@ async function* transformStreamResponse(
   const reader = readableStream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  
+  // 用于存储所有引用，以便在结束时生成参考资料部分
+  const references: Reference[] = [];
+  let referencesEmitted = false;
 
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        // 如果有引用但尚未发送，在结束前发送参考资料部分
+        if (references.length > 0 && !referencesEmitted) {
+          const referencesSection = generateReferencesSection(references);
+          yield `data: ${JSON.stringify({
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: "sophnet-model",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  content: `\n\n${referencesSection}`,
+                },
+                finish_reason: null,
+              },
+            ],
+          })}\n\n`;
+          referencesEmitted = true;
+        }
+        break;
+      }
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
@@ -376,6 +425,27 @@ async function* transformStreamResponse(
         
         const data = line.substring(5).trim();
         if (data === "[DONE]") {
+          // 如果有引用但尚未发送，在结束前发送参考资料部分
+          if (references.length > 0 && !referencesEmitted) {
+            const referencesSection = generateReferencesSection(references);
+            yield `data: ${JSON.stringify({
+              id: `chatcmpl-${Date.now()}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: "sophnet-model",
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    content: `\n\n${referencesSection}`,
+                  },
+                  finish_reason: null,
+                },
+              ],
+            })}\n\n`;
+            referencesEmitted = true;
+          }
+          
           yield "data: [DONE]\n\n";
           continue;
         }
@@ -383,25 +453,59 @@ async function* transformStreamResponse(
         try {
           const sophNetEvent = JSON.parse(data);
           
-          // 转换为OpenAI格式的事件
-          const openAIEvent = {
-            id: sophNetEvent.id || `chatcmpl-${Date.now()}`,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: sophNetEvent.model || "sophnet-model",
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  reasoning_content: sophNetEvent.choices?.[0]?.delta?.reasoning_content || "", 
-                  content: sophNetEvent.choices?.[0]?.delta?.content || "",
+          // 检查是否包含引用
+          if (sophNetEvent.choices?.[0]?.refs && sophNetEvent.choices[0].refs.length > 0) {
+            // 处理引用
+            for (const ref of sophNetEvent.choices[0].refs) {
+              // 检查是否已经存在相同URL的引用
+              const existingRefIndex = references.findIndex(r => r.url === ref.url);
+              if (existingRefIndex === -1) {
+                // 添加新引用
+                references.push(ref);
+                
+                // 生成引用标记，使用上标数字
+                const refIndex = references.length;
+                const superscriptIndex = `⁽${convertToSuperscript(refIndex)}⁾`;
+                
+                // 创建带引用标记的事件
+                yield `data: ${JSON.stringify({
+                  id: sophNetEvent.id || `chatcmpl-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: sophNetEvent.model || "sophnet-model",
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        content: `[${superscriptIndex}](${ref.url})`,
+                      },
+                      finish_reason: null,
+                    },
+                  ],
+                })}\n\n`;
+              }
+            }
+          } else {
+            // 转换为OpenAI格式的事件
+            const openAIEvent = {
+              id: sophNetEvent.id || `chatcmpl-${Date.now()}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: sophNetEvent.model || "sophnet-model",
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    reasoning_content: sophNetEvent.choices?.[0]?.delta?.reasoning_content || "", 
+                    content: sophNetEvent.choices?.[0]?.delta?.content || "",
+                  },
+                  finish_reason: sophNetEvent.choices?.[0]?.finish_reason || null,
                 },
-                finish_reason: sophNetEvent.choices?.[0]?.finish_reason || null,
-              },
-            ],
-          };
-          
-          yield `data: ${JSON.stringify(openAIEvent)}\n\n`;
+              ],
+            };
+            
+            yield `data: ${JSON.stringify(openAIEvent)}\n\n`;
+          }
         } catch (e) {
           console.error("Error parsing event:", e, "Line:", line);
         }
@@ -412,9 +516,45 @@ async function* transformStreamResponse(
   }
 }
 
+// 生成参考资料部分
+function generateReferencesSection(references: Reference[]): string {
+  if (references.length === 0) return "";
+  
+  let section = "## 参考资料\n\n";
+  references.forEach((ref, index) => {
+    section += `${index + 1}. [${ref.title}](${ref.url})\n`;
+  });
+  
+  return section;
+}
+
 // 转换非流式响应
 async function transformNonStreamResponse(response: Response) {
   const sophNetResponse = await response.json();
+  
+  // 处理引用
+  let content = sophNetResponse.choices?.[0]?.message?.content || "";
+  const references: Reference[] = [];
+  
+  // 收集所有引用
+  if (sophNetResponse.choices?.[0]?.message?.refs && sophNetResponse.choices[0].message.refs.length > 0) {
+    for (const ref of sophNetResponse.choices[0].message.refs) {
+      references.push(ref);
+    }
+    
+    // 为每个引用添加上标标记
+    references.forEach((ref, index) => {
+      const refIndex = index + 1;
+      const superscriptIndex = `⁽${convertToSuperscript(refIndex)}⁾`;
+      // 在内容末尾添加引用标记
+      content += ` [${superscriptIndex}](${ref.url})`;
+    });
+    
+    // 添加参考资料部分
+    if (references.length > 0) {
+      content += "\n\n" + generateReferencesSection(references);
+    }
+  }
   
   return {
     id: sophNetResponse.id || `chatcmpl-${Date.now()}`,
@@ -427,7 +567,7 @@ async function transformNonStreamResponse(response: Response) {
         message: {
           role: "assistant",
           reasoning_content: sophNetResponse.choices?.[0]?.message?.reasoning_content || "",
-          content: sophNetResponse.choices?.[0]?.message?.content || "",
+          content: content,
         },
         finish_reason: sophNetResponse.choices?.[0]?.finish_reason || "stop",
       },
